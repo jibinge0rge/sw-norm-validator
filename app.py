@@ -88,12 +88,30 @@ if uploaded_file is not None:
     st.write("### Preview of Data")
     st.dataframe(df.head())
 
+    # Choose the column to analyze for normalization
+    st.write("### Choose field to analyze")
+    columns_list = list(df.columns)
+    default_messy_index = columns_list.index("software_name") if "software_name" in columns_list else 0
+    messy_field = st.selectbox(
+        "Column to check for normalization issues:",
+        options=columns_list,
+        index=default_messy_index,
+        help="Within each group, values from this column will be compared"
+    )
+
     # User selects grouping fields
     st.write("### Choose fields to group by")
     group_fields = st.multiselect(
-        "Select keys for grouping (e.g., host, cve, first_found_date, software_version):",
-        options=list(df.columns),
-        default=["host", "cve", "first_found_date", "software_version"]
+        "Select keys for grouping (e.g., source_p_id, target_p_id, relationship_first_seen_date, software_version):",
+        options=columns_list,
+        default=[
+            c for c in [
+                "source_p_id",
+                "target_p_id",
+                "relationship_first_seen_date",
+                "software_version",
+            ] if c in columns_list
+        ]
     )
 
     # Matching settings
@@ -166,12 +184,12 @@ if uploaded_file is not None:
             with st.spinner("Processing groups... this may take a while for large datasets"):
                 grouped = (
                     df.groupby(group_fields)
-                    .agg({"software_name": lambda x: list(x)})
+                    .agg({messy_field: lambda x: list(x)})
                     .reset_index()
                 )
 
                 # Apply classification with swifter using selected settings
-                grouped["issue_type"] = grouped["software_name"].swifter.apply(
+                grouped["issue_type"] = grouped[messy_field].swifter.apply(
                     lambda names: classify(
                         names,
                         threshold=threshold,
