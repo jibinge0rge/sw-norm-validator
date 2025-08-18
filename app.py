@@ -211,9 +211,66 @@ if uploaded_file is not None:
             summary["Percentage"] = (summary["Count"] / total_groups * 100).round(1)
             st.dataframe(summary)
 
-            # Show results
+            # Show results with filtering controls
             st.write("### Detailed Results")
-            st.dataframe(grouped)
+            with st.expander("Filter detailed results"):
+                filter_columns = st.multiselect(
+                    "Select columns to filter",
+                    options=list(grouped.columns),
+                )
+
+                filtered_df = grouped.copy()
+
+                for col in filter_columns:
+                    series = grouped[col]
+                    # Numeric range filter
+                    if pd.api.types.is_numeric_dtype(series):
+                        min_value = float(series.min()) if pd.notna(series.min()) else 0.0
+                        max_value = float(series.max()) if pd.notna(series.max()) else 0.0
+                        selected_min, selected_max = st.slider(
+                            f"{col} range",
+                            min_value=min_value,
+                            max_value=max_value,
+                            value=(min_value, max_value),
+                        )
+                        filtered_df = filtered_df[filtered_df[col].between(selected_min, selected_max)]
+
+                    # Datetime range filter
+                    elif pd.api.types.is_datetime64_any_dtype(series):
+                        series_dt = pd.to_datetime(series, errors="coerce")
+                        min_date = series_dt.min().date() if not series_dt.isna().all() else None
+                        max_date = series_dt.max().date() if not series_dt.isna().all() else None
+                        if min_date is not None and max_date is not None:
+                            start_date, end_date = st.date_input(
+                                f"{col} date range",
+                                value=(min_date, max_date),
+                            )
+                            col_dt = pd.to_datetime(filtered_df[col], errors="coerce").dt.date
+                            filtered_df = filtered_df[(col_dt >= start_date) & (col_dt <= end_date)]
+
+                    # Categorical / text filter
+                    else:
+                        unique_values = series.dropna().astype(str).unique().tolist()
+                        if len(unique_values) <= 100:
+                            selected_values = st.multiselect(
+                                f"{col} values",
+                                options=sorted(unique_values),
+                                default=sorted(unique_values),
+                            )
+                            filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected_values)]
+                        else:
+                            query = st.text_input(f"{col} contains")
+                            if query:
+                                filtered_df = filtered_df[
+                                    filtered_df[col].astype(str).str.contains(query, case=False, na=False)
+                                ]
+
+                display_columns = st.multiselect(
+                    "Columns to display",
+                    options=list(filtered_df.columns),
+                    default=list(filtered_df.columns),
+                )
+                st.dataframe(filtered_df[display_columns])
 
             # Download option
             @st.cache_data
