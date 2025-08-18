@@ -1,0 +1,211 @@
+import streamlit as st
+import pandas as pd
+from itertools import combinations
+from rapidfuzz import fuzz
+import swifter
+import re
+
+# ----------------------------
+# Core classification helpers
+# ----------------------------
+def _normalize_name(raw_text: str, stopwords: list[str]) -> str:
+    text = str(raw_text).lower()
+    text = re.sub(r"[^a-z0-9]+", " ", text)
+    tokens = [tok for tok in text.split() if tok and tok not in stopwords]
+    return " ".join(tokens).strip()
+
+
+def classify(
+    names,
+    threshold: int = 85,
+    metric: str = "token_set_ratio",
+    decision_rule: str = "any_pair",  # any_pair | all_pairs | proportion_at_least
+    proportion: float = 0.5,
+    normalize_text: bool = True,
+    stopwords: list[str] | None = None,
+):
+    if not isinstance(names, list):
+        names = list(names)
+    original_unique_names = list(set(names))
+
+    # Single unique name → clearly clean
+    if len(original_unique_names) == 1:
+        return "Clean"
+
+    # Choose similarity function
+    metric_map = {
+        "token_set_ratio": fuzz.token_set_ratio,
+        "token_sort_ratio": fuzz.token_sort_ratio,
+        "partial_ratio": fuzz.partial_ratio,
+        "WRatio": fuzz.WRatio,
+    }
+    similarity = metric_map.get(metric, fuzz.token_set_ratio)
+
+    # Prepare names
+    default_stopwords = ["browser", "server", "database", "db"]
+    active_stopwords = default_stopwords if stopwords is None else stopwords
+    prepared_names = (
+        [_normalize_name(n, active_stopwords) for n in original_unique_names]
+        if normalize_text
+        else [str(n) for n in original_unique_names]
+    )
+
+    # If normalization collapses all to one token, it's a normalization issue
+    if normalize_text and len(set(prepared_names)) == 1:
+        return "Normalization Issue"
+
+    # Compute pairwise scores
+    scores = []
+    for a, b in combinations(prepared_names, 2):
+        score = similarity(a, b)
+        scores.append(score)
+
+    if not scores:
+        return "Clean"
+
+    # Decide based on rule
+    if decision_rule == "all_pairs":
+        decision = min(scores) >= threshold
+    elif decision_rule == "proportion_at_least":
+        fraction = sum(s >= threshold for s in scores) / len(scores)
+        decision = fraction >= proportion
+    else:  # any_pair
+        decision = max(scores) >= threshold
+
+    return "Normalization Issue" if decision else "True Multi-Software"
+
+
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+st.set_page_config(layout="wide")
+st.title("🔎 Software Normalization Checker")
+
+uploaded_file = st.file_uploader("Upload your CSV", type=["csv"])
+
+if uploaded_file is not None:
+    df = pd.read_csv(uploaded_file)
+    st.write("### Preview of Data")
+    st.dataframe(df.head())
+
+    # User selects grouping fields
+    st.write("### Choose fields to group by")
+    group_fields = st.multiselect(
+        "Select keys for grouping (e.g., host, cve, first_found_date, software_version):",
+        options=list(df.columns),
+        default=["host", "cve", "first_found_date", "software_version"]
+    )
+
+    # Matching settings
+    st.write("### Matching Settings")
+    threshold = st.slider(
+        "Fuzzy matching threshold",
+        min_value=0,
+        max_value=100,
+        value=85,
+        step=1,
+        help="Minimum similarity score to consider two names equivalent"
+    )
+    metric = st.selectbox(
+        "Similarity metric",
+        options=["token_set_ratio", "token_sort_ratio", "partial_ratio", "WRatio"],
+        index=0,
+        help=(
+            "How to compare two names: token_set_ratio ignores word order and extra words; "
+            "token_sort_ratio compares sorted words; partial_ratio checks substrings; "
+            "WRatio automatically chooses a robust combo."
+        ),
+    )
+    decision_rule = st.selectbox(
+        "Decision rule",
+        options=["any_pair", "all_pairs", "proportion_at_least"],
+        index=0,
+        help=(
+            "How to decide within a group: any_pair is sensitive, all_pairs is strict, "
+            "proportion_at_least lets you choose a required fraction."
+        ),
+    )
+    proportion = 0.5
+    if decision_rule == "proportion_at_least":
+        proportion = st.slider(
+            "Required fraction of similar pairs",
+            min_value=0.0,
+            max_value=1.0,
+            value=0.5,
+            step=0.05,
+            help="If this fraction of pairs exceeds the threshold, mark as normalization issue"
+        )
+    normalize_text = st.checkbox(
+        "Normalize strings (lowercase, remove punctuation, drop generic words)",
+        value=True,
+    )
+    extra_stopwords = st.text_input(
+        "Extra generic words to ignore (comma-separated)", value=""
+    )
+    stopwords = [w.strip().lower() for w in extra_stopwords.split(",") if w.strip()]
+
+    with st.expander("What do 'Similarity metric' and 'Decision rule' mean?"):
+        st.markdown(
+            """
+            - **Similarity metric**: how we score how close two names are (0–100).
+              - **token_set_ratio**: Ignores word order and extra words. Best default for cases like `Google Chrome` vs `Chrome Browser` or `google-chrome`.
+              - **token_sort_ratio**: Compares the same words after sorting. Extra/missing words lower the score more than with set.
+              - **partial_ratio**: Good when one name is contained in the other (substring), e.g., `PostgreSQL` vs `PostgreSQL Database`.
+              - **WRatio**: Tries several strategies and picks the best. General-purpose and robust.
+            - **Decision rule**: how we decide for a whole group of names.
+              - **any_pair**: If any pair of names reaches the threshold → flag as a normalization issue (sensitive).
+              - **all_pairs**: Only flag if every pair reaches the threshold → strict; mixed groups usually won't trigger.
+              - **proportion_at_least**: Flag if at least the chosen fraction of pairs reach the threshold. Use the slider to set the fraction.
+            """
+        )
+
+    if len(group_fields) == 0:
+        st.warning("Please select at least one field to group by.")
+    else:
+        if st.button("🚀 Run Normalization Analysis"):
+            with st.spinner("Processing groups... this may take a while for large datasets"):
+                grouped = (
+                    df.groupby(group_fields)
+                    .agg({"software_name": lambda x: list(x)})
+                    .reset_index()
+                )
+
+                # Apply classification with swifter using selected settings
+                grouped["issue_type"] = grouped["software_name"].swifter.apply(
+                    lambda names: classify(
+                        names,
+                        threshold=threshold,
+                        metric=metric,
+                        decision_rule=decision_rule,
+                        proportion=proportion,
+                        normalize_text=normalize_text,
+                        stopwords=stopwords if stopwords else None,
+                    )
+                )
+
+            st.success("✅ Processing Complete!")
+
+            # Summary
+            st.write("### Summary Counts")
+            total_groups = len(grouped)
+            summary = grouped["issue_type"].value_counts().reset_index()
+            summary.columns = ["Issue Type", "Count"]
+            summary["Percentage"] = (summary["Count"] / total_groups * 100).round(1)
+            st.dataframe(summary)
+
+            # Show results
+            st.write("### Detailed Results")
+            st.dataframe(grouped)
+
+            # Download option
+            @st.cache_data
+            def convert_df(_df):
+                return _df.to_csv(index=False).encode("utf-8")
+
+            csv = convert_df(grouped)
+            st.download_button(
+                label="📥 Download Results as CSV",
+                data=csv,
+                file_name="normalization_analysis.csv",
+                mime="text/csv",
+            )
