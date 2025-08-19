@@ -119,6 +119,8 @@ if uploaded_file is not None:
     # Session state for persisting results across reruns
     if "grouped_results" not in st.session_state:
         st.session_state["grouped_results"] = None
+    # Persist uploaded data for summary stats across reruns
+    st.session_state["uploaded_df"] = df
 
     # Choose the column to analyze for normalization
     st.write("### Choose field to analyze")
@@ -235,7 +237,10 @@ if uploaded_file is not None:
 
             # Flag groups that contain both NULL and non-NULL values for the selected field
             grouped["has_null_and_value"] = grouped[messy_field].apply(
-                lambda vals: any(pd.isna(v) for v in vals) and any(not pd.isna(v) for v in vals)
+                lambda vals: (
+                    any((v is None) or (pd.isna(v)) or (isinstance(v, str) and v.strip() == "") for v in vals)
+                    and any(not ((v is None) or (pd.isna(v)) or (isinstance(v, str) and v.strip() == "")) for v in vals)
+                )
             )
 
             st.session_state["grouped_results"] = grouped
@@ -247,29 +252,48 @@ if uploaded_file is not None:
     if results_df is not None:
         # Summary
         st.write("### Summary Counts")
-        total_groups = len(results_df)
-        summary = results_df["issue_type"].value_counts().reset_index()
-        summary.columns = ["Issue Type", "Count"]
-        summary["Percentage"] = (summary["Count"] / total_groups * 100).round(1)
-        st.dataframe(summary)
-
-        # Mixed NULL/non-NULL groups count for the selected field
+        # Top-line metrics
+        total_records = len(st.session_state.get("uploaded_df", results_df))
         selected_messy_field = st.session_state.get("selected_messy_field", None)
+        null_records = 0
+        if selected_messy_field and selected_messy_field in st.session_state.get("uploaded_df", results_df).columns:
+            series_orig = st.session_state.get("uploaded_df", results_df)[selected_messy_field]
+            null_mask = series_orig.isna() | (series_orig.astype(str).str.strip() == "")
+            null_records = int(null_mask.sum())
+        # Mixed NULL/non-NULL groups count for the selected field (treat empty as NULL)
         mixed_count = 0
         if selected_messy_field and selected_messy_field in results_df.columns:
             mixed_count = int(
                 results_df[selected_messy_field]
-                .apply(lambda vals: any(pd.isna(v) for v in vals) and any(not pd.isna(v) for v in vals))
+                .apply(lambda vals: (
+                    any((v is None) or (pd.isna(v)) or (isinstance(v, str) and v.strip() == "") for v in vals)
+                    and any(not ((v is None) or (pd.isna(v)) or (isinstance(v, str) and v.strip() == "")) for v in vals)
+                ))
                 .sum()
             )
-        st.metric(
+
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total records", total_records)
+        m2.metric(
+            label=(f"Records without '{selected_messy_field}'" if selected_messy_field else "Records without selected field"),
+            value=null_records,
+        )
+        m3.metric(
             label=(
-                f"Groups with NULL and non-NULL in '{selected_messy_field}'"
-                if selected_messy_field
-                else "Groups with NULL and non-NULL"
+                f"Groups with NULL and non-NULL in '{selected_messy_field}'" if selected_messy_field else "Groups with NULL and non-NULL"
             ),
             value=mixed_count,
         )
+        total_groups = len(results_df)
+        summary = results_df["issue_type"].value_counts().reset_index()
+        summary.columns = ["Issue Type", "Count"]
+        summary["Percentage"] = (summary["Count"] / total_groups * 100).round(1)
+        # Append a total row
+        total_row = pd.DataFrame([
+            {"Issue Type": "Total", "Count": int(summary["Count"].sum()), "Percentage": ""}
+        ])
+        summary_with_total = pd.concat([summary, total_row], ignore_index=True)
+        st.dataframe(summary_with_total)
 
         # Filters and detailed results (no dropdown)
         st.write("### Detailed Results")
