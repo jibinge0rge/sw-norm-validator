@@ -26,11 +26,33 @@ def classify(
 ):
     if not isinstance(names, list):
         names = list(names)
-    original_unique_names = list(set(names))
 
-    # Single unique name → clearly clean
-    if len(original_unique_names) == 1:
-        return "Clean"
+    # Treat both real NULLs and empty/whitespace strings as missing
+    def _is_missing(value) -> bool:
+        if value is None:
+            return True
+        try:
+            if pd.isna(value):
+                return True
+        except Exception:
+            pass
+        if isinstance(value, str) and value.strip() == "":
+            return True
+        return False
+
+    non_null_values = [v for v in names if not _is_missing(v)]
+    has_null = len(non_null_values) != len(names)
+    # Distinct non-null values (case-insensitive, trimmed) for decision around NULL behavior
+    distinct_non_null = list({str(v).strip().lower() for v in non_null_values})
+    num_distinct_non_null = len(distinct_non_null)
+
+    # If there are no non-null values at all, consider it a normalization issue
+    if num_distinct_non_null == 0:
+        return "Normalization Issue"
+
+    # If there is exactly one non-null value and NULLs present → normalization issue
+    if num_distinct_non_null == 1:
+        return "Normalization Issue" if has_null else "Clean"
 
     # Choose similarity function
     metric_map = {
@@ -44,10 +66,12 @@ def classify(
     # Prepare names
     default_stopwords = ["browser", "server", "database", "db"]
     active_stopwords = default_stopwords if stopwords is None else stopwords
+    # Use only non-null original values for similarity checks
+    original_unique_non_null_values = list({str(v) for v in non_null_values})
     prepared_names = (
-        [_normalize_name(n, active_stopwords) for n in original_unique_names]
+        [_normalize_name(n, active_stopwords) for n in original_unique_non_null_values]
         if normalize_text
-        else [str(n) for n in original_unique_names]
+        else [str(n) for n in original_unique_non_null_values]
     )
 
     # If normalization collapses all to one token, it's a normalization issue
@@ -71,6 +95,10 @@ def classify(
         decision = fraction >= proportion
     else:  # any_pair
         decision = max(scores) >= threshold
+
+    # Apply NULL-aware overrides
+    if has_null and num_distinct_non_null > 1:
+        return "Multi-Software + Normalization Issue"
 
     return "Normalization Issue" if decision else "True Multi-Software"
 
@@ -205,7 +233,13 @@ if uploaded_file is not None:
                     )
                 )
 
+            # Flag groups that contain both NULL and non-NULL values for the selected field
+            grouped["has_null_and_value"] = grouped[messy_field].apply(
+                lambda vals: any(pd.isna(v) for v in vals) and any(not pd.isna(v) for v in vals)
+            )
+
             st.session_state["grouped_results"] = grouped
+            st.session_state["selected_messy_field"] = messy_field
             st.success("✅ Processing Complete!")
 
     # If results exist, show summary, filters, table, and download regardless of reruns
@@ -218,6 +252,24 @@ if uploaded_file is not None:
         summary.columns = ["Issue Type", "Count"]
         summary["Percentage"] = (summary["Count"] / total_groups * 100).round(1)
         st.dataframe(summary)
+
+        # Mixed NULL/non-NULL groups count for the selected field
+        selected_messy_field = st.session_state.get("selected_messy_field", None)
+        mixed_count = 0
+        if selected_messy_field and selected_messy_field in results_df.columns:
+            mixed_count = int(
+                results_df[selected_messy_field]
+                .apply(lambda vals: any(pd.isna(v) for v in vals) and any(not pd.isna(v) for v in vals))
+                .sum()
+            )
+        st.metric(
+            label=(
+                f"Groups with NULL and non-NULL in '{selected_messy_field}'"
+                if selected_messy_field
+                else "Groups with NULL and non-NULL"
+            ),
+            value=mixed_count,
+        )
 
         # Filters and detailed results (no dropdown)
         st.write("### Detailed Results")
