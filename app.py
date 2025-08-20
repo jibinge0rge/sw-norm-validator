@@ -400,14 +400,6 @@ if uploaded_files:
                 )
             )
 
-            # Lightweight columns for safe UI display
-            grouped["values_count"] = grouped[messy_field].apply(lambda vals: len(vals) if isinstance(vals, list) else 0)
-            def _preview(vals):
-                if not isinstance(vals, list):
-                    return ""
-                sample = [str(v) for v in vals[:3]]
-                return ", ".join(sample) + (" …" if len(vals) > 3 else "")
-            grouped["values_preview"] = grouped[messy_field].apply(_preview)
 
             st.session_state["grouped_results"] = grouped
             st.session_state["selected_messy_field"] = messy_field
