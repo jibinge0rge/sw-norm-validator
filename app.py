@@ -4,6 +4,8 @@ from itertools import combinations
 from rapidfuzz import fuzz
 import swifter
 import re
+from concurrent.futures import ThreadPoolExecutor
+import io
 
 # ----------------------------
 # Core classification helpers
@@ -109,11 +111,103 @@ def classify(
 st.set_page_config(layout="wide")
 st.title("🔎 Software Normalization Checker")
 
-uploaded_file = st.file_uploader("Upload your CSV", type=["csv"])
 
-if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
-    st.write("### Preview of Data")
+@st.cache_data(show_spinner=False)
+def load_and_combine_files(file_payloads):
+    def _read_single_csv_payload(payload):
+        name, content = payload
+        try:
+            return pd.read_csv(io.BytesIO(content))
+        except Exception:
+            return pd.DataFrame()
+
+    if not file_payloads:
+        return pd.DataFrame()
+
+    if len(file_payloads) == 1:
+        return _read_single_csv_payload(file_payloads[0])
+
+    max_workers = min(8, len(file_payloads))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        dfs = list(executor.map(_read_single_csv_payload, file_payloads))
+    dfs = [d for d in dfs if not d.empty]
+    if len(dfs) == 0:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True, sort=False)
+
+
+# Build groups with row-level progress updates for very large datasets
+def build_groups_with_progress(df: pd.DataFrame, group_fields: list[str], messy_field: str, on_progress=None, approx_steps: int = 200) -> pd.DataFrame:
+    from collections import defaultdict
+
+    total_rows = len(df)
+    if total_rows == 0:
+        return pd.DataFrame(columns=[*group_fields, messy_field])
+
+    groups = defaultdict(list)
+    # Choose chunk size to yield about `approx_steps` updates
+    chunk_size = max(1, total_rows // max(1, approx_steps))
+    processed = 0
+
+    cols_to_use = list(group_fields) + [messy_field]
+    for start in range(0, total_rows, chunk_size):
+        end = min(start + chunk_size, total_rows)
+        chunk = df.iloc[start:end][cols_to_use]
+
+        if len(group_fields) == 0:
+            # Should not happen due to UI guard, but handle gracefully
+            groups[()].extend(chunk[messy_field].tolist())
+        else:
+            chunk_grouped = chunk.groupby(group_fields)[messy_field].apply(list)
+            for key, lst in chunk_grouped.items():
+                # Ensure tuple keys for consistent dict usage
+                if not isinstance(key, tuple):
+                    key = (key,)
+                groups[key].extend(lst)
+
+        processed = end
+        if on_progress is not None:
+            try:
+                on_progress(processed, total_rows, len(groups))
+            except Exception:
+                # Do not fail computation due to UI callback errors
+                pass
+
+    if len(groups) == 0:
+        return pd.DataFrame(columns=[*group_fields, messy_field])
+
+    keys = list(groups.keys())
+    values = list(groups.values())
+    keys_df = pd.DataFrame(keys, columns=group_fields)
+    keys_df[messy_field] = values
+    return keys_df
+
+
+uploaded_files = st.file_uploader("Upload your CSV files", type=["csv"], accept_multiple_files=True)
+
+if uploaded_files:
+    # Create a lightweight signature of the current upload set
+    file_keys = tuple(sorted((getattr(f, "name", str(i)), getattr(f, "size", None)) for i, f in enumerate(uploaded_files)))
+
+    if (
+        "uploaded_df" in st.session_state
+        and st.session_state.get("loaded_file_keys") == file_keys
+    ):
+        df = st.session_state["uploaded_df"]
+    else:
+        with st.spinner("Loading and combining files..."):
+            payloads = [
+                (getattr(f, "name", f"file_{i}"), f.getbuffer().tobytes())
+                for i, f in enumerate(uploaded_files)
+            ]
+            df = load_and_combine_files(payloads)
+            if df.empty:
+                st.error("No valid CSV data loaded.")
+                st.stop()
+            st.session_state["uploaded_df"] = df
+            st.session_state["loaded_file_keys"] = file_keys
+
+    st.write("### Preview of Combined Data")
     st.dataframe(df.head())
 
     # Session state for persisting results across reruns
@@ -125,7 +219,7 @@ if uploaded_file is not None:
     # Choose the column to analyze for normalization
     st.write("### Choose field to analyze")
     columns_list = list(df.columns)
-    default_messy_index = columns_list.index("software_name") if "software_name" in columns_list else 0
+    default_messy_index = columns_list.index("software_product") if "software_product" in columns_list else 0
     messy_field = st.selectbox(
         "Column to check for normalization issues:",
         options=columns_list,
@@ -136,14 +230,12 @@ if uploaded_file is not None:
     # User selects grouping fields
     st.write("### Choose fields to group by")
     group_fields = st.multiselect(
-        "Select keys for grouping (e.g., source_p_id, target_p_id, relationship_first_seen_date, software_version):",
+        "Select keys for grouping (e.g., source_p_id, target_p_id):",
         options=columns_list,
         default=[
             c for c in [
                 "source_p_id",
                 "target_p_id",
-                "relationship_first_seen_date",
-                "software_version",
             ] if c in columns_list
         ]
     )
@@ -195,6 +287,14 @@ if uploaded_file is not None:
         "Extra generic words to ignore (comma-separated)", value=""
     )
     stopwords = [w.strip().lower() for w in extra_stopwords.split(",") if w.strip()]
+    use_swifter = st.checkbox(
+        "Accelerate classification with Swifter (chunked progress)",
+        value=True,
+        help=(
+            "Uses swifter to speed up apply in chunks while still updating the Streamlit progress bar. "
+            "Disable if you encounter environment-specific issues."
+        ),
+    )
 
     with st.expander("What do 'Similarity metric' and 'Decision rule' mean?"):
         st.markdown(
@@ -215,25 +315,82 @@ if uploaded_file is not None:
         st.warning("Please select at least one field to group by.")
     else:
         if st.button("🚀 Run Normalization Analysis"):
-            with st.spinner("Processing groups... this may take a while for large datasets"):
-                grouped = (
-                    df.groupby(group_fields)
-                    .agg({messy_field: lambda x: list(x)})
-                    .reset_index()
+            # First, prepare groups with row-level progress
+            st.write("Preparing groups...")
+            group_progress = st.progress(0)
+            group_status = st.empty()
+
+            def on_group_progress(processed_rows: int, total_rows: int, discovered_groups: int):
+                pct = int(processed_rows / total_rows * 100) if total_rows else 100
+                group_progress.progress(pct)
+                group_status.text(
+                    f"Reading rows {processed_rows:,}/{total_rows:,} ({pct}%). Groups discovered so far: {discovered_groups:,}"
                 )
 
-                # Apply classification with swifter using selected settings
-                grouped["issue_type"] = grouped[messy_field].swifter.apply(
-                    lambda names: classify(
-                        names,
-                        threshold=threshold,
-                        metric=metric,
-                        decision_rule=decision_rule,
-                        proportion=proportion,
-                        normalize_text=normalize_text,
-                        stopwords=stopwords if stopwords else None,
+            grouped = build_groups_with_progress(
+                df=df,
+                group_fields=group_fields,
+                messy_field=messy_field,
+                on_progress=on_group_progress,
+                approx_steps=200,
+            )
+            group_status.text("Grouping complete.")
+
+            # Classify with progress updates
+            total_groups = len(grouped)
+            progress_bar = st.progress(0)
+            status_placeholder = st.empty()
+
+            if use_swifter and total_groups > 0:
+                # Chunked swifter apply: balanced between speed and UI progress
+                desired_updates = 100
+                chunk_size = max(1, total_groups // desired_updates)
+                processed = 0
+                # Ensure column exists
+                grouped["issue_type"] = None
+                for start in range(0, total_groups, chunk_size):
+                    end = min(start + chunk_size, total_groups)
+                    subset_idx = grouped.index[start:end]
+                    series_subset = grouped.loc[subset_idx, messy_field]
+                    result_subset = series_subset.swifter.apply(
+                        lambda names: classify(
+                            names,
+                            threshold=threshold,
+                            metric=metric,
+                            decision_rule=decision_rule,
+                            proportion=proportion,
+                            normalize_text=normalize_text,
+                            stopwords=stopwords if stopwords else None,
+                        )
                     )
-                )
+                    grouped.loc[subset_idx, "issue_type"] = result_subset.values
+                    processed = end
+                    pct = int(processed / total_groups * 100)
+                    progress_bar.progress(pct)
+                    status_placeholder.text(
+                        f"Processed {processed}/{total_groups} groups ({pct}%). Remaining: {total_groups - processed}"
+                    )
+            else:
+                # Fallback: per-group loop for progress
+                issue_types = []
+                for idx, names in enumerate(grouped[messy_field].tolist(), start=1):
+                    issue_types.append(
+                        classify(
+                            names,
+                            threshold=threshold,
+                            metric=metric,
+                            decision_rule=decision_rule,
+                            proportion=proportion,
+                            normalize_text=normalize_text,
+                            stopwords=stopwords if stopwords else None,
+                        )
+                    )
+                    pct = int(idx / total_groups * 100) if total_groups else 100
+                    progress_bar.progress(pct)
+                    status_placeholder.text(
+                        f"Processed {idx}/{total_groups} groups ({pct}%). Remaining: {total_groups - idx}"
+                    )
+                grouped["issue_type"] = issue_types
 
             # Flag groups that contain both NULL and non-NULL values for the selected field
             grouped["has_null_and_value"] = grouped[messy_field].apply(
