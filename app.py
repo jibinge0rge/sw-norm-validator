@@ -400,8 +400,22 @@ if uploaded_files:
                 )
             )
 
+            # Lightweight columns for safe UI display
+            grouped["values_count"] = grouped[messy_field].apply(lambda vals: len(vals) if isinstance(vals, list) else 0)
+            def _preview(vals):
+                if not isinstance(vals, list):
+                    return ""
+                sample = [str(v) for v in vals[:3]]
+                return ", ".join(sample) + (" …" if len(vals) > 3 else "")
+            grouped["values_preview"] = grouped[messy_field].apply(_preview)
+
             st.session_state["grouped_results"] = grouped
             st.session_state["selected_messy_field"] = messy_field
+            # Increment a version so we only auto-save once per new result set
+            st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+            # Reset saved version to force save on next render
+            st.session_state["results_saved_version"] = None
+            st.session_state["saved_results_path"] = None
             st.success("✅ Processing Complete!")
 
     # If results exist, show summary, filters, table, and download regardless of reruns
@@ -452,18 +466,32 @@ if uploaded_files:
         summary_with_total = pd.concat([summary, total_row], ignore_index=True)
         st.dataframe(summary_with_total)
 
-        # Filters and detailed results (no dropdown)
+        # Filters and detailed results with safe defaults and pagination
         st.write("### Detailed Results")
+        # Exclude the heavy list column by default from filter options
+        safe_filter_options = [c for c in results_df.columns if c != messy_field]
+        default_filter_columns = ["issue_type"] if "issue_type" in safe_filter_options else []
         filter_columns = st.multiselect(
             "Select columns to filter",
-            options=list(results_df.columns),
+            options=safe_filter_options,
+            default=default_filter_columns,
             key="filter_columns",
         )
 
         filtered_df = results_df.copy()
 
+        def _is_listy_column(series: pd.Series) -> bool:
+            for v in series:
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    continue
+                return isinstance(v, (list, tuple))
+            return False
+
         for col in filter_columns:
             series = results_df[col]
+            # Skip list-like columns entirely (not efficient to filter client-side)
+            if _is_listy_column(series):
+                continue
             # Numeric range filter
             if pd.api.types.is_numeric_dtype(series):
                 min_value = float(series.min()) if pd.notna(series.min()) else 0.0
@@ -493,12 +521,18 @@ if uploaded_files:
 
             # Categorical / text filter
             else:
-                unique_values = series.dropna().astype(str).unique().tolist()
+                # Cap unique extraction to avoid huge transfers
+                unique_values = pd.unique(series.dropna().astype(str))
                 if len(unique_values) <= 100:
+                    options_values = sorted(map(str, unique_values.tolist()))
+                    if col == "issue_type":
+                        default_values = ["Normalization Issue"] if "Normalization Issue" in options_values else options_values
+                    else:
+                        default_values = options_values
                     selected_values = st.multiselect(
                         f"{col} values",
-                        options=sorted(unique_values),
-                        default=sorted(unique_values),
+                        options=options_values,
+                        default=default_values,
                         key=f"filter_{col}_values",
                     )
                     filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected_values)]
@@ -509,23 +543,52 @@ if uploaded_files:
                             filtered_df[col].astype(str).str.contains(query, case=False, na=False)
                         ]
 
+        # Columns to display (include the software column again; exclude it from defaults)
+        all_display_options = list(filtered_df.columns)
+        default_display_columns = all_display_options
         display_columns = st.multiselect(
             "Columns to display",
-            options=list(filtered_df.columns),
-            default=list(filtered_df.columns),
+            options=all_display_options,
+            default=default_display_columns,
             key="display_columns",
         )
-        st.dataframe(filtered_df[display_columns])
+
+        # Pagination controls
+        total_rows = len(filtered_df)
+        page_size = st.slider("Rows per page", min_value=50, max_value=2000, value=200, step=50)
+        max_pages = max(1, (total_rows + page_size - 1) // page_size)
+        page_number = st.number_input("Page", min_value=1, max_value=max_pages, value=1, step=1)
+        start = (page_number - 1) * page_size
+        end = min(start + page_size, total_rows)
+        st.caption(f"Showing rows {start+1:,}–{end:,} of {total_rows:,}")
+        page_df = filtered_df.iloc[start:end]
+        # Show the selected slice including the software list column if chosen
+        st.dataframe(page_df[display_columns])
 
         # Download option (full results)
-        @st.cache_data
-        def convert_df(_df):
-            return _df.to_csv(index=False).encode("utf-8")
+        # Auto-save to Output/normalization_analysis.csv on every new result
+        import os
+        os.makedirs("Output", exist_ok=True)
+        output_path = os.path.join("Output", "normalization_analysis.csv")
+        current_version = st.session_state.get("results_version")
+        saved_version = st.session_state.get("results_saved_version")
+        if current_version is not None and current_version != saved_version:
+            # Persist to disk once per new computed result
+            results_df.to_csv(output_path, index=False)
+            st.session_state["results_saved_version"] = current_version
+            st.session_state["saved_results_path"] = output_path
+            st.success(f"Auto-saved results to {output_path}")
+        else:
+            st.info(f"File available on server: {output_path}")
 
-        csv = convert_df(results_df)
-        st.download_button(
-            label="📥 Download Results as CSV",
-            data=csv,
-            file_name="normalization_analysis.csv",
-            mime="text/csv",
-        )
+        # Optional small inline download for convenience (when small enough)
+        st.write("### Export")
+        approx_bytes = int(results_df.memory_usage(deep=True).sum())
+        if approx_bytes < 50 * 1024 * 1024:  # <50MB
+            csv_small = results_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📥 Download Results as CSV (inline)",
+                data=csv_small,
+                file_name="normalization_analysis.csv",
+                mime="text/csv",
+            )

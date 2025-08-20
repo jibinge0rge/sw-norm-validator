@@ -1,5 +1,6 @@
 venv/
 sample_data.csv
 Data/
+Output/
 Combined_Data.csv
 combine_data.py
