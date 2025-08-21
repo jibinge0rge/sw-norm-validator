@@ -4,6 +4,8 @@ from itertools import combinations
 from rapidfuzz import fuzz
 import swifter
 import re
+from concurrent.futures import ThreadPoolExecutor
+import io
 
 # ----------------------------
 # Core classification helpers
@@ -46,13 +48,13 @@ def classify(
     distinct_non_null = list({str(v).strip().lower() for v in non_null_values})
     num_distinct_non_null = len(distinct_non_null)
 
-    # If there are no non-null values at all, consider it a normalization issue
+    # If there are no non-null values at all → software extraction issue
     if num_distinct_non_null == 0:
-        return "Normalization Issue"
+        return "No Software Extracted"
 
-    # If there is exactly one non-null value and NULLs present → normalization issue
+    # If there is exactly one non-null value and NULLs present → software extraction issue
     if num_distinct_non_null == 1:
-        return "Normalization Issue" if has_null else "Clean"
+        return "Software Extraction Issue" if has_null else "Clean"
 
     # Choose similarity function
     metric_map = {
@@ -98,7 +100,7 @@ def classify(
 
     # Apply NULL-aware overrides
     if has_null and num_distinct_non_null > 1:
-        return "Multi-Software + Normalization Issue"
+        return "Multi-Software + Software Extraction Issue"
 
     return "Normalization Issue" if decision else "True Multi-Software"
 
@@ -109,11 +111,103 @@ def classify(
 st.set_page_config(layout="wide")
 st.title("🔎 Software Normalization Checker")
 
-uploaded_file = st.file_uploader("Upload your CSV", type=["csv"])
 
-if uploaded_file is not None:
-    df = pd.read_csv(uploaded_file)
-    st.write("### Preview of Data")
+@st.cache_data(show_spinner=False)
+def load_and_combine_files(file_payloads):
+    def _read_single_csv_payload(payload):
+        name, content = payload
+        try:
+            return pd.read_csv(io.BytesIO(content))
+        except Exception:
+            return pd.DataFrame()
+
+    if not file_payloads:
+        return pd.DataFrame()
+
+    if len(file_payloads) == 1:
+        return _read_single_csv_payload(file_payloads[0])
+
+    max_workers = min(8, len(file_payloads))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        dfs = list(executor.map(_read_single_csv_payload, file_payloads))
+    dfs = [d for d in dfs if not d.empty]
+    if len(dfs) == 0:
+        return pd.DataFrame()
+    return pd.concat(dfs, ignore_index=True, sort=False)
+
+
+# Build groups with row-level progress updates for very large datasets
+def build_groups_with_progress(df: pd.DataFrame, group_fields: list[str], messy_field: str, on_progress=None, approx_steps: int = 200) -> pd.DataFrame:
+    from collections import defaultdict
+
+    total_rows = len(df)
+    if total_rows == 0:
+        return pd.DataFrame(columns=[*group_fields, messy_field])
+
+    groups = defaultdict(list)
+    # Choose chunk size to yield about `approx_steps` updates
+    chunk_size = max(1, total_rows // max(1, approx_steps))
+    processed = 0
+
+    cols_to_use = list(group_fields) + [messy_field]
+    for start in range(0, total_rows, chunk_size):
+        end = min(start + chunk_size, total_rows)
+        chunk = df.iloc[start:end][cols_to_use]
+
+        if len(group_fields) == 0:
+            # Should not happen due to UI guard, but handle gracefully
+            groups[()].extend(chunk[messy_field].tolist())
+        else:
+            chunk_grouped = chunk.groupby(group_fields)[messy_field].apply(list)
+            for key, lst in chunk_grouped.items():
+                # Ensure tuple keys for consistent dict usage
+                if not isinstance(key, tuple):
+                    key = (key,)
+                groups[key].extend(lst)
+
+        processed = end
+        if on_progress is not None:
+            try:
+                on_progress(processed, total_rows, len(groups))
+            except Exception:
+                # Do not fail computation due to UI callback errors
+                pass
+
+    if len(groups) == 0:
+        return pd.DataFrame(columns=[*group_fields, messy_field])
+
+    keys = list(groups.keys())
+    values = list(groups.values())
+    keys_df = pd.DataFrame(keys, columns=group_fields)
+    keys_df[messy_field] = values
+    return keys_df
+
+
+uploaded_files = st.file_uploader("Upload your CSV files", type=["csv"], accept_multiple_files=True)
+
+if uploaded_files:
+    # Create a lightweight signature of the current upload set
+    file_keys = tuple(sorted((getattr(f, "name", str(i)), getattr(f, "size", None)) for i, f in enumerate(uploaded_files)))
+
+    if (
+        "uploaded_df" in st.session_state
+        and st.session_state.get("loaded_file_keys") == file_keys
+    ):
+        df = st.session_state["uploaded_df"]
+    else:
+        with st.spinner("Loading and combining files..."):
+            payloads = [
+                (getattr(f, "name", f"file_{i}"), f.getbuffer().tobytes())
+                for i, f in enumerate(uploaded_files)
+            ]
+            df = load_and_combine_files(payloads)
+            if df.empty:
+                st.error("No valid CSV data loaded.")
+                st.stop()
+            st.session_state["uploaded_df"] = df
+            st.session_state["loaded_file_keys"] = file_keys
+
+    st.write("### Preview of Combined Data")
     st.dataframe(df.head())
 
     # Session state for persisting results across reruns
@@ -125,7 +219,7 @@ if uploaded_file is not None:
     # Choose the column to analyze for normalization
     st.write("### Choose field to analyze")
     columns_list = list(df.columns)
-    default_messy_index = columns_list.index("software_name") if "software_name" in columns_list else 0
+    default_messy_index = columns_list.index("software_product") if "software_product" in columns_list else 0
     messy_field = st.selectbox(
         "Column to check for normalization issues:",
         options=columns_list,
@@ -136,14 +230,12 @@ if uploaded_file is not None:
     # User selects grouping fields
     st.write("### Choose fields to group by")
     group_fields = st.multiselect(
-        "Select keys for grouping (e.g., source_p_id, target_p_id, relationship_first_seen_date, software_version):",
+        "Select keys for grouping (e.g., source_p_id, target_p_id):",
         options=columns_list,
         default=[
             c for c in [
                 "source_p_id",
                 "target_p_id",
-                "relationship_first_seen_date",
-                "software_version",
             ] if c in columns_list
         ]
     )
@@ -195,6 +287,14 @@ if uploaded_file is not None:
         "Extra generic words to ignore (comma-separated)", value=""
     )
     stopwords = [w.strip().lower() for w in extra_stopwords.split(",") if w.strip()]
+    use_swifter = st.checkbox(
+        "Accelerate classification with Swifter (chunked progress)",
+        value=True,
+        help=(
+            "Uses swifter to speed up apply in chunks while still updating the Streamlit progress bar. "
+            "Disable if you encounter environment-specific issues."
+        ),
+    )
 
     with st.expander("What do 'Similarity metric' and 'Decision rule' mean?"):
         st.markdown(
@@ -215,25 +315,82 @@ if uploaded_file is not None:
         st.warning("Please select at least one field to group by.")
     else:
         if st.button("🚀 Run Normalization Analysis"):
-            with st.spinner("Processing groups... this may take a while for large datasets"):
-                grouped = (
-                    df.groupby(group_fields)
-                    .agg({messy_field: lambda x: list(x)})
-                    .reset_index()
+            # First, prepare groups with row-level progress
+            st.write("Preparing groups...")
+            group_progress = st.progress(0)
+            group_status = st.empty()
+
+            def on_group_progress(processed_rows: int, total_rows: int, discovered_groups: int):
+                pct = int(processed_rows / total_rows * 100) if total_rows else 100
+                group_progress.progress(pct)
+                group_status.text(
+                    f"Reading rows {processed_rows:,}/{total_rows:,} ({pct}%). Groups discovered so far: {discovered_groups:,}"
                 )
 
-                # Apply classification with swifter using selected settings
-                grouped["issue_type"] = grouped[messy_field].swifter.apply(
-                    lambda names: classify(
-                        names,
-                        threshold=threshold,
-                        metric=metric,
-                        decision_rule=decision_rule,
-                        proportion=proportion,
-                        normalize_text=normalize_text,
-                        stopwords=stopwords if stopwords else None,
+            grouped = build_groups_with_progress(
+                df=df,
+                group_fields=group_fields,
+                messy_field=messy_field,
+                on_progress=on_group_progress,
+                approx_steps=200,
+            )
+            group_status.text("Grouping complete.")
+
+            # Classify with progress updates
+            total_groups = len(grouped)
+            progress_bar = st.progress(0)
+            status_placeholder = st.empty()
+
+            if use_swifter and total_groups > 0:
+                # Chunked swifter apply: balanced between speed and UI progress
+                desired_updates = 100
+                chunk_size = max(1, total_groups // desired_updates)
+                processed = 0
+                # Ensure column exists
+                grouped["issue_type"] = None
+                for start in range(0, total_groups, chunk_size):
+                    end = min(start + chunk_size, total_groups)
+                    subset_idx = grouped.index[start:end]
+                    series_subset = grouped.loc[subset_idx, messy_field]
+                    result_subset = series_subset.swifter.apply(
+                        lambda names: classify(
+                            names,
+                            threshold=threshold,
+                            metric=metric,
+                            decision_rule=decision_rule,
+                            proportion=proportion,
+                            normalize_text=normalize_text,
+                            stopwords=stopwords if stopwords else None,
+                        )
                     )
-                )
+                    grouped.loc[subset_idx, "issue_type"] = result_subset.values
+                    processed = end
+                    pct = int(processed / total_groups * 100)
+                    progress_bar.progress(pct)
+                    status_placeholder.text(
+                        f"Processed {processed}/{total_groups} groups ({pct}%). Remaining: {total_groups - processed}"
+                    )
+            else:
+                # Fallback: per-group loop for progress
+                issue_types = []
+                for idx, names in enumerate(grouped[messy_field].tolist(), start=1):
+                    issue_types.append(
+                        classify(
+                            names,
+                            threshold=threshold,
+                            metric=metric,
+                            decision_rule=decision_rule,
+                            proportion=proportion,
+                            normalize_text=normalize_text,
+                            stopwords=stopwords if stopwords else None,
+                        )
+                    )
+                    pct = int(idx / total_groups * 100) if total_groups else 100
+                    progress_bar.progress(pct)
+                    status_placeholder.text(
+                        f"Processed {idx}/{total_groups} groups ({pct}%). Remaining: {total_groups - idx}"
+                    )
+                grouped["issue_type"] = issue_types
 
             # Flag groups that contain both NULL and non-NULL values for the selected field
             grouped["has_null_and_value"] = grouped[messy_field].apply(
@@ -243,8 +400,14 @@ if uploaded_file is not None:
                 )
             )
 
+
             st.session_state["grouped_results"] = grouped
             st.session_state["selected_messy_field"] = messy_field
+            # Increment a version so we only auto-save once per new result set
+            st.session_state["results_version"] = st.session_state.get("results_version", 0) + 1
+            # Reset saved version to force save on next render
+            st.session_state["results_saved_version"] = None
+            st.session_state["saved_results_path"] = None
             st.success("✅ Processing Complete!")
 
     # If results exist, show summary, filters, table, and download regardless of reruns
@@ -295,18 +458,45 @@ if uploaded_file is not None:
         summary_with_total = pd.concat([summary, total_row], ignore_index=True)
         st.dataframe(summary_with_total)
 
-        # Filters and detailed results (no dropdown)
+        # Help section explaining what each category means
+        with st.expander("📖 What do these categories mean?"):
+            st.markdown("""
+            **Issue Type Categories:**
+            
+            - **No Software Extracted**: Group has no software values at all (all NULL/empty)
+            - **Software Extraction Issue**: Some records have software, others don't (partial extraction)
+            - **Normalization Issue**: Same software written in different ways (e.g., "Chrome" vs "Google Chrome")
+            - **Multi-Software + Software Extraction Issue**: Multiple different software AND some missing data
+            - **True Multi-Software**: Legitimate multiple different software products
+            - **Clean**: Consistent data with no quality issues detected
+            """)
+
+        # Filters and detailed results with safe defaults and pagination
         st.write("### Detailed Results")
+        # Exclude the heavy list column by default from filter options
+        safe_filter_options = [c for c in results_df.columns if c != messy_field]
+        default_filter_columns = ["issue_type"] if "issue_type" in safe_filter_options else []
         filter_columns = st.multiselect(
             "Select columns to filter",
-            options=list(results_df.columns),
+            options=safe_filter_options,
+            default=default_filter_columns,
             key="filter_columns",
         )
 
         filtered_df = results_df.copy()
 
+        def _is_listy_column(series: pd.Series) -> bool:
+            for v in series:
+                if v is None or (isinstance(v, float) and pd.isna(v)):
+                    continue
+                return isinstance(v, (list, tuple))
+            return False
+
         for col in filter_columns:
             series = results_df[col]
+            # Skip list-like columns entirely (not efficient to filter client-side)
+            if _is_listy_column(series):
+                continue
             # Numeric range filter
             if pd.api.types.is_numeric_dtype(series):
                 min_value = float(series.min()) if pd.notna(series.min()) else 0.0
@@ -336,12 +526,18 @@ if uploaded_file is not None:
 
             # Categorical / text filter
             else:
-                unique_values = series.dropna().astype(str).unique().tolist()
+                # Cap unique extraction to avoid huge transfers
+                unique_values = pd.unique(series.dropna().astype(str))
                 if len(unique_values) <= 100:
+                    options_values = sorted(map(str, unique_values.tolist()))
+                    if col == "issue_type":
+                        default_values = ["Normalization Issue"] if "Normalization Issue" in options_values else options_values
+                    else:
+                        default_values = options_values
                     selected_values = st.multiselect(
                         f"{col} values",
-                        options=sorted(unique_values),
-                        default=sorted(unique_values),
+                        options=options_values,
+                        default=default_values,
                         key=f"filter_{col}_values",
                     )
                     filtered_df = filtered_df[filtered_df[col].astype(str).isin(selected_values)]
@@ -352,23 +548,52 @@ if uploaded_file is not None:
                             filtered_df[col].astype(str).str.contains(query, case=False, na=False)
                         ]
 
+        # Columns to display (include the software column again; exclude it from defaults)
+        all_display_options = list(filtered_df.columns)
+        default_display_columns = all_display_options
         display_columns = st.multiselect(
             "Columns to display",
-            options=list(filtered_df.columns),
-            default=list(filtered_df.columns),
+            options=all_display_options,
+            default=default_display_columns,
             key="display_columns",
         )
-        st.dataframe(filtered_df[display_columns])
+
+        # Pagination controls
+        total_rows = len(filtered_df)
+        page_size = st.slider("Rows per page", min_value=50, max_value=2000, value=200, step=50)
+        max_pages = max(1, (total_rows + page_size - 1) // page_size)
+        page_number = st.number_input("Page", min_value=1, max_value=max_pages, value=1, step=1)
+        start = (page_number - 1) * page_size
+        end = min(start + page_size, total_rows)
+        st.caption(f"Showing rows {start+1:,}–{end:,} of {total_rows:,}")
+        page_df = filtered_df.iloc[start:end]
+        # Show the selected slice including the software list column if chosen
+        st.dataframe(page_df[display_columns])
 
         # Download option (full results)
-        @st.cache_data
-        def convert_df(_df):
-            return _df.to_csv(index=False).encode("utf-8")
+        # Auto-save to Output/normalization_analysis.csv on every new result
+        import os
+        os.makedirs("Output", exist_ok=True)
+        output_path = os.path.join("Output", "normalization_analysis.csv")
+        current_version = st.session_state.get("results_version")
+        saved_version = st.session_state.get("results_saved_version")
+        if current_version is not None and current_version != saved_version:
+            # Persist to disk once per new computed result
+            results_df.to_csv(output_path, index=False)
+            st.session_state["results_saved_version"] = current_version
+            st.session_state["saved_results_path"] = output_path
+            st.success(f"Auto-saved results to {output_path}")
+        else:
+            st.info(f"File available on server: {output_path}")
 
-        csv = convert_df(results_df)
-        st.download_button(
-            label="📥 Download Results as CSV",
-            data=csv,
-            file_name="normalization_analysis.csv",
-            mime="text/csv",
-        )
+        # Optional small inline download for convenience (when small enough)
+        approx_bytes = int(results_df.memory_usage(deep=True).sum())
+        if approx_bytes < 50 * 1024 * 1024:  # <50MB
+            st.write("### Export")
+            csv_small = results_df.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                label="📥 Download Results as CSV (inline)",
+                data=csv_small,
+                file_name="normalization_analysis.csv",
+                mime="text/csv",
+            )
