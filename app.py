@@ -48,13 +48,13 @@ def classify(
     distinct_non_null = list({str(v).strip().lower() for v in non_null_values})
     num_distinct_non_null = len(distinct_non_null)
 
-    # If there are no non-null values at all, consider it a normalization issue
+    # If there are no non-null values at all → software extraction issue
     if num_distinct_non_null == 0:
-        return "Normalization Issue"
+        return "No Software Extracted"
 
-    # If there is exactly one non-null value and NULLs present → normalization issue
+    # If there is exactly one non-null value and NULLs present → software extraction issue
     if num_distinct_non_null == 1:
-        return "Normalization Issue" if has_null else "Clean"
+        return "Software Extraction Issue" if has_null else "Clean"
 
     # Choose similarity function
     metric_map = {
@@ -100,7 +100,7 @@ def classify(
 
     # Apply NULL-aware overrides
     if has_null and num_distinct_non_null > 1:
-        return "Multi-Software + Normalization Issue"
+        return "Multi-Software + Software Extraction Issue"
 
     return "Normalization Issue" if decision else "True Multi-Software"
 
@@ -574,9 +574,9 @@ if uploaded_files:
             st.info(f"File available on server: {output_path}")
 
         # Optional small inline download for convenience (when small enough)
-        st.write("### Export")
         approx_bytes = int(results_df.memory_usage(deep=True).sum())
         if approx_bytes < 50 * 1024 * 1024:  # <50MB
+            st.write("### Export")
             csv_small = results_df.to_csv(index=False).encode("utf-8")
             st.download_button(
                 label="📥 Download Results as CSV (inline)",
