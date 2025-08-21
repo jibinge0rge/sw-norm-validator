@@ -458,6 +458,19 @@ if uploaded_files:
         summary_with_total = pd.concat([summary, total_row], ignore_index=True)
         st.dataframe(summary_with_total)
 
+        # Help section explaining what each category means
+        with st.expander("📖 What do these categories mean?"):
+            st.markdown("""
+            **Issue Type Categories:**
+            
+            - **No Software Extracted**: Group has no software values at all (all NULL/empty)
+            - **Software Extraction Issue**: Some records have software, others don't (partial extraction)
+            - **Normalization Issue**: Same software written in different ways (e.g., "Chrome" vs "Google Chrome")
+            - **Multi-Software + Software Extraction Issue**: Multiple different software AND some missing data
+            - **True Multi-Software**: Legitimate multiple different software products
+            - **Clean**: Consistent data with no quality issues detected
+            """)
+
         # Filters and detailed results with safe defaults and pagination
         st.write("### Detailed Results")
         # Exclude the heavy list column by default from filter options
